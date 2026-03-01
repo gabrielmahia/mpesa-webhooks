@@ -1,385 +1,410 @@
 """mpesa-webhooks test suite."""
 from __future__ import annotations
 
+import json
 import pytest
 from datetime import datetime
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
-from mpesa_webhooks.models import (
-    StkPushCallback, B2CResultCallback, C2BPaymentCallback,
-    detect_callback_type, CallbackType,
+from mpesa_webhooks import (
+    MpesaWebhookRouter,
+    InMemoryStorage,
+    STKSuccessEvent,
+    STKFailureEvent,
+    B2CResultEvent,
+    C2BConfirmationEvent,
 )
-from mpesa_webhooks.idempotency import InMemoryIdempotencyStore, IdempotencyChecker
-from mpesa_webhooks.dlq import InMemoryDLQ, DeadLetter
 
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 
-def stk_success_payload(checkout_id="ws_CO_123"):
+@pytest.fixture
+def storage():
+    return InMemoryStorage()
+
+@pytest.fixture
+def router(storage):
+    return MpesaWebhookRouter(storage=storage)
+
+@pytest.fixture
+def app(router):
+    app = FastAPI()
+    app.include_router(router.router, prefix="/mpesa")
+    return app
+
+@pytest.fixture
+def client(app):
+    return TestClient(app)
+
+
+# ── Payload builders ────────────────────────────────────────────────────────────
+
+def stk_success_payload(checkout_id="ws_CO_123", receipt="NLJ7RT61SV", amount=100, phone=254712345678):
     return {
         "Body": {
             "stkCallback": {
-                "MerchantRequestID": "29115-1234",
+                "MerchantRequestID": "29115-34620561-1",
                 "CheckoutRequestID": checkout_id,
                 "ResultCode": 0,
                 "ResultDesc": "The service request is processed successfully.",
                 "CallbackMetadata": {
                     "Item": [
-                        {"Name": "Amount", "Value": 100},
-                        {"Name": "MpesaReceiptNumber", "Value": "NLJ7RT61SV"},
-                        {"Name": "TransactionDate", "Value": 20240101120000},
-                        {"Name": "PhoneNumber", "Value": 254712345678},
+                        {"Name": "Amount", "Value": amount},
+                        {"Name": "MpesaReceiptNumber", "Value": receipt},
+                        {"Name": "TransactionDate", "Value": 20240115143022},
+                        {"Name": "PhoneNumber", "Value": phone},
                     ]
-                },
+                }
             }
         }
     }
 
-def stk_failure_payload(result_code=1032, checkout_id="ws_CO_456"):
+def stk_failure_payload(checkout_id="ws_CO_456", result_code=1032, desc="Request cancelled by user"):
     return {
         "Body": {
             "stkCallback": {
-                "MerchantRequestID": "29115-5678",
+                "MerchantRequestID": "29115-34620561-2",
                 "CheckoutRequestID": checkout_id,
                 "ResultCode": result_code,
-                "ResultDesc": "Request cancelled by user",
+                "ResultDesc": desc,
             }
         }
     }
 
-def b2c_payload(conv_id="AG_001", txn_id="LGR9193RY5"):
+def b2c_result_payload(result_code=0, receipt="NLJ7RT61SV", amount=500):
+    params = []
+    if result_code == 0:
+        params = [
+            {"Key": "TransactionAmount", "Value": amount},
+            {"Key": "TransactionReceipt", "Value": receipt},
+            {"Key": "ReceiverPartyPublicName", "Value": "254712345678 - John Doe"},
+        ]
     return {
         "Result": {
-            "ResultType": 0,
-            "ResultCode": 0,
-            "ResultDesc": "The service request is processed successfully.",
-            "OriginatorConversationID": "ORIG-001",
-            "ConversationID": conv_id,
-            "TransactionID": txn_id,
-            "ResultParameters": {
-                "ResultParameter": [
-                    {"Key": "TransactionAmount", "Value": 500},
-                    {"Key": "ReceiverPartyPublicName", "Value": "254712345678 - Jane Wanjiku"},
-                ]
-            }
+            "ResultCode": result_code,
+            "ResultDesc": "The service request is processed successfully." if result_code == 0 else "Failed",
+            "ConversationID": "AG_20240115_1234",
+            "OriginatorConversationID": "12345-67890-1",
+            "ResultParameters": {"ResultParameter": params},
         }
     }
 
-def c2b_payload():
+def c2b_confirmation_payload(trans_id="NLJ7RT61SV", amount=500, ref="INV001"):
     return {
         "TransactionType": "Pay Bill",
-        "TransID": "LGR019G3J2",
-        "TransTime": "20191122063845",
-        "TransAmount": "10",
-        "BusinessShortCode": "600638",
-        "BillRefNumber": "account",
-        "InvoiceNumber": "",
-        "OrgAccountBalance": "",
-        "ThirdPartyTransID": "",
-        "MSISDN": "254708374149",
+        "TransID": trans_id,
+        "TransTime": "20240115143022",
+        "TransAmount": str(amount),
+        "BusinessShortCode": "600000",
+        "BillRefNumber": ref,
+        "MSISDN": "254712345678",
         "FirstName": "John",
-        "MiddleName": "",
         "LastName": "Doe",
     }
 
 
-# ── StkPushCallback ────────────────────────────────────────────────────────────
+# ── Health ─────────────────────────────────────────────────────────────────────
 
-class TestStkPushCallback:
-    def test_success_parse(self):
-        cb = StkPushCallback.from_daraja(stk_success_payload())
-        assert cb.succeeded
-        assert cb.result_code == 0
-        assert cb.amount == 100.0
-        assert cb.mpesa_receipt == "NLJ7RT61SV"
-        assert cb.phone_number == "254712345678"
+class TestHealth:
+    def test_health_ok(self, client):
+        r = client.get("/mpesa/health")
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
 
-    def test_success_transaction_date_parsed(self):
-        cb = StkPushCallback.from_daraja(stk_success_payload())
-        assert isinstance(cb.transaction_date, datetime)
-        assert cb.transaction_date.year == 2024
-
-    def test_user_cancelled(self):
-        cb = StkPushCallback.from_daraja(stk_failure_payload(1032))
-        assert not cb.succeeded
-        assert cb.user_cancelled
-        assert cb.amount is None
-        assert cb.mpesa_receipt is None
-
-    def test_insufficient_funds(self):
-        cb = StkPushCallback.from_daraja(stk_failure_payload(1))
-        assert cb.insufficient_funds
-
-    def test_failure_has_no_metadata(self):
-        cb = StkPushCallback.from_daraja(stk_failure_payload())
-        assert cb.amount is None
-        assert cb.mpesa_receipt is None
-        assert cb.transaction_date is None
-
-    def test_checkout_id_preserved(self):
-        cb = StkPushCallback.from_daraja(stk_success_payload("ws_CO_TEST"))
-        assert cb.checkout_request_id == "ws_CO_TEST"
-
-    def test_invalid_payload_raises(self):
-        with pytest.raises(ValueError):
-            StkPushCallback.from_daraja({"wrong": "structure"})
-
-    def test_missing_body_raises(self):
-        with pytest.raises(ValueError):
-            StkPushCallback.from_daraja({})
+    def test_health_has_timestamp(self, client):
+        r = client.get("/mpesa/health")
+        assert "timestamp" in r.json()
 
 
-# ── B2CResultCallback ──────────────────────────────────────────────────────────
+# ── STK Success ────────────────────────────────────────────────────────────────
 
-class TestB2CResultCallback:
-    def test_success_parse(self):
-        cb = B2CResultCallback.from_daraja(b2c_payload())
-        assert cb.succeeded
-        assert cb.transaction_amount == 500.0
-        assert cb.conversation_id == "AG_001"
-        assert cb.transaction_id == "LGR9193RY5"
-
-    def test_receiver_phone_extracted(self):
-        cb = B2CResultCallback.from_daraja(b2c_payload())
-        assert cb.receiver_phone == "254712345678"
-
-    def test_invalid_payload_raises(self):
-        with pytest.raises(ValueError):
-            B2CResultCallback.from_daraja({"no": "result"})
-
-
-# ── C2BPaymentCallback ─────────────────────────────────────────────────────────
-
-class TestC2BPaymentCallback:
-    def test_parse(self):
-        cb = C2BPaymentCallback.from_daraja(c2b_payload())
-        assert cb.trans_id == "LGR019G3J2"
-        assert cb.trans_amount == 10.0
-        assert cb.msisdn == "254708374149"
-        assert cb.first_name == "John"
-
-    def test_missing_required_key_raises(self):
-        bad = c2b_payload()
-        del bad["TransID"]
-        with pytest.raises(ValueError):
-            C2BPaymentCallback.from_daraja(bad)
-
-
-# ── detect_callback_type ───────────────────────────────────────────────────────
-
-class TestDetectCallbackType:
-    def test_detects_stk(self):
-        assert detect_callback_type(stk_success_payload()) == CallbackType.STK_PUSH
-
-    def test_detects_b2c(self):
-        assert detect_callback_type(b2c_payload()) == CallbackType.B2C_RESULT
-
-    def test_detects_c2b(self):
-        assert detect_callback_type(c2b_payload()) == CallbackType.C2B_PAYMENT
-
-    def test_unknown(self):
-        assert detect_callback_type({"random": "data"}) == CallbackType.UNKNOWN
-
-
-# ── IdempotencyChecker ─────────────────────────────────────────────────────────
-
-class TestIdempotency:
-    def test_first_call_not_duplicate(self):
-        checker = IdempotencyChecker()
-        assert not checker.is_duplicate("stk:abc")
-
-    def test_after_mark_is_duplicate(self):
-        checker = IdempotencyChecker()
-        checker.mark_processed("stk:abc")
-        assert checker.is_duplicate("stk:abc")
-
-    def test_check_and_mark_first_call_returns_false(self):
-        checker = IdempotencyChecker()
-        assert not checker.check_and_mark("stk:xyz")
-
-    def test_check_and_mark_second_call_returns_true(self):
-        checker = IdempotencyChecker()
-        checker.check_and_mark("stk:xyz")
-        assert checker.check_and_mark("stk:xyz")
-
-    def test_different_keys_independent(self):
-        checker = IdempotencyChecker()
-        checker.mark_processed("stk:one")
-        assert not checker.is_duplicate("stk:two")
-
-    def test_expired_key_not_duplicate(self):
-        import time
-        store = InMemoryIdempotencyStore()
-        store.mark("stk:old", ttl_seconds=0)
-        time.sleep(0.01)
-        assert not store.exists("stk:old")
-
-    def test_store_len(self):
-        store = InMemoryIdempotencyStore()
-        store.mark("k1")
-        store.mark("k2")
-        assert len(store) == 2
-
-
-# ── InMemoryDLQ ────────────────────────────────────────────────────────────────
-
-class TestDLQ:
-    def _letter(self, key="stk:fail"):
-        return DeadLetter(
-            callback_type="stk_push",
-            idempotency_key=key,
-            raw_payload={"test": True},
-            error="DB connection failed",
-        )
-
-    def test_push_and_pending(self):
-        dlq = InMemoryDLQ()
-        dlq.push(self._letter())
-        assert len(dlq.pending()) == 1
-
-    def test_max_attempts_exhausted(self):
-        dlq = InMemoryDLQ(max_attempts=3)
-        letter = self._letter()
-        letter.attempts = 3
-        dlq.push(letter)
-        assert len(dlq.pending()) == 0
-        assert len(dlq.exhausted()) == 1
-
-    def test_remove(self):
-        dlq = InMemoryDLQ()
-        letter = self._letter()
-        dlq.push(letter)
-        dlq.remove(letter)
-        assert len(dlq) == 0
-
-    def test_clear(self):
-        dlq = InMemoryDLQ()
-        dlq.push(self._letter("k1"))
-        dlq.push(self._letter("k2"))
-        dlq.clear()
-        assert len(dlq) == 0
-
-    def test_backoff_increases(self):
-        dlq = InMemoryDLQ()
-        assert dlq.backoff_seconds(0) < dlq.backoff_seconds(1)
-        assert dlq.backoff_seconds(1) < dlq.backoff_seconds(2)
-
-    def test_backoff_caps_at_480(self):
-        dlq = InMemoryDLQ()
-        assert dlq.backoff_seconds(99) == 480
-
-
-# ── FastAPI router integration ─────────────────────────────────────────────────
-
-class TestRouter:
-    def _app(self, config=None):
-        from fastapi import FastAPI
-        from mpesa_webhooks.router import build_router
-        app = FastAPI()
-        app.include_router(build_router(config), prefix="/mpesa")
-        return app
-
-    def _client(self, app):
-        from fastapi.testclient import TestClient
-        return TestClient(app)
-
-    def test_stk_success_returns_200(self):
-        client = self._client(self._app())
+class TestSTKSuccess:
+    def test_returns_200(self, client):
         r = client.post("/mpesa/stk/callback", json=stk_success_payload())
         assert r.status_code == 200
+
+    def test_returns_ack(self, client):
+        r = client.post("/mpesa/stk/callback", json=stk_success_payload())
         assert r.json()["ResultCode"] == 0
 
-    def test_stk_failure_returns_200(self):
-        client = self._client(self._app())
+    def test_handler_called(self, router, client):
+        received = []
+
+        @router.on_stk_success
+        async def handler(event: STKSuccessEvent):
+            received.append(event)
+
+        client.post("/mpesa/stk/callback", json=stk_success_payload())
+        assert len(received) == 1
+        assert received[0].receipt == "NLJ7RT61SV"
+        assert received[0].amount == 100
+        assert received[0].checkout_request_id == "ws_CO_123"
+
+    def test_phone_captured(self, router, client):
+        received = []
+
+        @router.on_stk_success
+        async def handler(event: STKSuccessEvent):
+            received.append(event)
+
+        client.post("/mpesa/stk/callback", json=stk_success_payload(phone=254787654321))
+        assert received[0].phone == "254787654321"
+
+    def test_transaction_date_parsed(self, router, client):
+        received = []
+
+        @router.on_stk_success
+        async def handler(event: STKSuccessEvent):
+            received.append(event)
+
+        client.post("/mpesa/stk/callback", json=stk_success_payload())
+        assert isinstance(received[0].transaction_date, datetime)
+        assert received[0].transaction_date.year == 2024
+
+    def test_receipt_saved_to_storage(self, client, storage):
+        client.post("/mpesa/stk/callback", json=stk_success_payload(receipt="ABC123"))
+        import asyncio
+        assert asyncio.get_event_loop().run_until_complete(storage.receipt_exists("ABC123"))
+
+
+class TestSTKIdempotency:
+    def test_duplicate_receipt_not_processed_twice(self, router, client):
+        received = []
+
+        @router.on_stk_success
+        async def handler(event: STKSuccessEvent):
+            received.append(event)
+
+        payload = stk_success_payload(receipt="DUPRECEIPT1")
+        client.post("/mpesa/stk/callback", json=payload)
+        client.post("/mpesa/stk/callback", json=payload)  # duplicate
+
+        assert len(received) == 1  # handler called only once
+
+    def test_duplicate_still_returns_200(self, client):
+        payload = stk_success_payload(receipt="DUPRECEIPT2")
+        r1 = client.post("/mpesa/stk/callback", json=payload)
+        r2 = client.post("/mpesa/stk/callback", json=payload)
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+
+    def test_different_receipts_both_processed(self, router, client):
+        received = []
+
+        @router.on_stk_success
+        async def handler(event: STKSuccessEvent):
+            received.append(event)
+
+        client.post("/mpesa/stk/callback", json=stk_success_payload(receipt="REC_AAA"))
+        client.post("/mpesa/stk/callback", json=stk_success_payload(receipt="REC_BBB"))
+
+        assert len(received) == 2
+
+
+# ── STK Failure ────────────────────────────────────────────────────────────────
+
+class TestSTKFailure:
+    def test_handler_called_on_cancel(self, router, client):
+        received = []
+
+        @router.on_stk_failure
+        async def handler(event: STKFailureEvent):
+            received.append(event)
+
+        client.post("/mpesa/stk/callback", json=stk_failure_payload(result_code=1032))
+        assert len(received) == 1
+        assert received[0].result_code == 1032
+
+    def test_handler_called_on_timeout(self, router, client):
+        received = []
+
+        @router.on_stk_failure
+        async def handler(event: STKFailureEvent):
+            received.append(event)
+
+        client.post("/mpesa/stk/callback", json=stk_failure_payload(result_code=1037))
+        assert received[0].result_code == 1037
+        assert received[0].result_desc
+
+    def test_result_desc_captured(self, router, client):
+        received = []
+
+        @router.on_stk_failure
+        async def handler(event: STKFailureEvent):
+            received.append(event)
+
+        client.post("/mpesa/stk/callback", json=stk_failure_payload(
+            result_code=1032, desc="Request cancelled by user"
+        ))
+        assert "cancel" in received[0].result_desc.lower()
+
+    def test_failure_returns_200(self, client):
         r = client.post("/mpesa/stk/callback", json=stk_failure_payload())
         assert r.status_code == 200
 
-    def test_b2c_result_returns_200(self):
-        client = self._client(self._app())
-        r = client.post("/mpesa/b2c/result", json=b2c_payload())
-        assert r.status_code == 200
 
-    def test_c2b_confirmation_returns_200(self):
-        client = self._client(self._app())
-        r = client.post("/mpesa/c2b/confirmation", json=c2b_payload())
-        assert r.status_code == 200
+# ── B2C Result ─────────────────────────────────────────────────────────────────
 
-    def test_c2b_validation_returns_200(self):
-        client = self._client(self._app())
-        r = client.post("/mpesa/c2b/validation", json={})
-        assert r.status_code == 200
-
-    def test_health_endpoint(self):
-        client = self._client(self._app())
-        r = client.get("/mpesa/health")
-        assert r.status_code == 200
-        data = r.json()
-        assert "status" in data
-        assert data["status"] == "ok"
-
-    def test_stk_handler_called_on_success(self):
-        from mpesa_webhooks.router import WebhookConfig
-
+class TestB2CResult:
+    def test_success_handler_called(self, router, client):
         received = []
-        def handler(cb): received.append(cb)
 
-        config = WebhookConfig(on_stk_success=handler)
-        client = self._client(self._app(config))
-        client.post("/mpesa/stk/callback", json=stk_success_payload())
+        @router.on_b2c_result
+        async def handler(event: B2CResultEvent):
+            received.append(event)
+
+        client.post("/mpesa/b2c/result", json=b2c_result_payload(receipt="B2C_REC_1"))
         assert len(received) == 1
-        assert received[0].mpesa_receipt == "NLJ7RT61SV"
+        assert received[0].succeeded
+        assert received[0].receipt == "B2C_REC_1"
+        assert received[0].amount == 500
 
-    def test_failure_handler_called_on_cancellation(self):
-        from mpesa_webhooks.router import WebhookConfig
-
+    def test_failure_handler_called(self, router, client):
         received = []
-        def handler(cb): received.append(cb)
 
-        config = WebhookConfig(on_stk_failure=handler)
-        client = self._client(self._app(config))
-        client.post("/mpesa/stk/callback", json=stk_failure_payload(1032))
+        @router.on_b2c_result
+        async def handler(event: B2CResultEvent):
+            received.append(event)
+
+        client.post("/mpesa/b2c/result", json=b2c_result_payload(result_code=1))
+        assert not received[0].succeeded
+
+    def test_b2c_idempotency(self, router, client):
+        received = []
+
+        @router.on_b2c_result
+        async def handler(event: B2CResultEvent):
+            received.append(event)
+
+        payload = b2c_result_payload(receipt="B2C_DUP_1")
+        client.post("/mpesa/b2c/result", json=payload)
+        client.post("/mpesa/b2c/result", json=payload)
         assert len(received) == 1
-        assert received[0].user_cancelled
 
-    def test_duplicate_stk_callback_not_handled_twice(self):
-        from mpesa_webhooks.router import WebhookConfig
+    def test_timeout_returns_200(self, client):
+        r = client.post("/mpesa/b2c/timeout", json={"Result": {"ResultCode": 1037}})
+        assert r.status_code == 200
 
+
+# ── C2B Confirmation ───────────────────────────────────────────────────────────
+
+class TestC2BConfirmation:
+    def test_handler_called(self, router, client):
         received = []
-        def handler(cb): received.append(cb)
 
-        config = WebhookConfig(on_stk_success=handler)
-        client = self._client(self._app(config))
-        payload = stk_success_payload("ws_CO_DEDUP_TEST")
-        client.post("/mpesa/stk/callback", json=payload)
-        client.post("/mpesa/stk/callback", json=payload)  # duplicate
-        assert len(received) == 1  # handler called exactly once
+        @router.on_c2b_confirmation
+        async def handler(event: C2BConfirmationEvent):
+            received.append(event)
 
-    def test_handler_exception_does_not_raise_500(self):
-        from mpesa_webhooks.router import WebhookConfig
+        client.post("/mpesa/c2b/confirmation", json=c2b_confirmation_payload())
+        assert len(received) == 1
+        assert received[0].trans_amount == 500
+        assert received[0].bill_ref_number == "INV001"
 
-        def bad_handler(cb):
+    def test_c2b_idempotency(self, router, client):
+        received = []
+
+        @router.on_c2b_confirmation
+        async def handler(event: C2BConfirmationEvent):
+            received.append(event)
+
+        payload = c2b_confirmation_payload(trans_id="C2B_DUP_1")
+        client.post("/mpesa/c2b/confirmation", json=payload)
+        client.post("/mpesa/c2b/confirmation", json=payload)
+        assert len(received) == 1
+
+    def test_validation_accepts(self, client):
+        r = client.post("/mpesa/c2b/validation", json=c2b_confirmation_payload())
+        assert r.status_code == 200
+        assert r.json()["ResultCode"] == 0
+
+
+# ── Dead-letter queue ──────────────────────────────────────────────────────────
+
+class TestDeadLetter:
+    def test_failing_handler_queued(self, router, client, storage):
+        @router.on_stk_success
+        async def bad_handler(event: STKSuccessEvent):
             raise RuntimeError("DB is down")
 
-        config = WebhookConfig(on_stk_success=bad_handler)
-        client = self._client(self._app(config))
-        r = client.post("/mpesa/stk/callback", json=stk_success_payload())
-        assert r.status_code == 200  # still 200 — DLQ absorbed the error
+        client.post("/mpesa/stk/callback", json=stk_success_payload(receipt="DL_REC_1"))
 
-    def test_failed_handler_writes_to_dlq(self):
-        from mpesa_webhooks.router import WebhookConfig
-        from mpesa_webhooks.dlq import InMemoryDLQ
+        import asyncio
+        letters = asyncio.get_event_loop().run_until_complete(storage.pop_dead_letters())
+        assert len(letters) == 1
+        assert "DB is down" in letters[0]["error"]
 
-        dlq = InMemoryDLQ()
+    def test_failing_handler_still_returns_200(self, router, client):
+        @router.on_stk_success
+        async def bad_handler(event: STKSuccessEvent):
+            raise ValueError("Something broke")
 
-        def bad_handler(cb):
-            raise RuntimeError("DB is down")
+        r = client.post("/mpesa/stk/callback", json=stk_success_payload(receipt="DL_REC_2"))
+        assert r.status_code == 200  # Daraja must always get 200 back
 
-        config = WebhookConfig(on_stk_success=bad_handler, dlq=dlq)
-        client = self._client(self._app(config))
-        client.post("/mpesa/stk/callback", json=stk_success_payload())
-        assert len(dlq) == 1
-        assert dlq.pending()[0].error == "DB is down"
+    def test_good_handler_runs_after_bad(self, router, client):
+        received = []
 
-    def test_malformed_stk_payload_returns_200(self):
-        client = self._client(self._app())
-        r = client.post("/mpesa/stk/callback", json={"garbage": True})
-        assert r.status_code == 200  # never 4xx to Daraja
+        @router.on_stk_success
+        async def bad_handler(event: STKSuccessEvent):
+            raise RuntimeError("first handler fails")
+
+        @router.on_stk_success
+        async def good_handler(event: STKSuccessEvent):
+            received.append(event)
+
+        client.post("/mpesa/stk/callback", json=stk_success_payload(receipt="DL_REC_3"))
+        assert len(received) == 1  # second handler still ran
+
+
+# ── Multiple handlers ──────────────────────────────────────────────────────────
+
+class TestMultipleHandlers:
+    def test_multiple_stk_success_handlers_all_called(self, router, client):
+        log_a, log_b = [], []
+
+        @router.on_stk_success
+        async def handler_a(event: STKSuccessEvent):
+            log_a.append(event.receipt)
+
+        @router.on_stk_success
+        async def handler_b(event: STKSuccessEvent):
+            log_b.append(event.amount)
+
+        client.post("/mpesa/stk/callback", json=stk_success_payload(receipt="MULTI_1", amount=250))
+        assert log_a == ["MULTI_1"]
+        assert log_b == [250]
+
+
+# ── HMAC verification ──────────────────────────────────────────────────────────
+
+class TestHMAC:
+    def _make_app(self, secret):
+        import hashlib, hmac as _hmac
+        router = MpesaWebhookRouter(hmac_secret=secret)
+        app = FastAPI()
+        app.include_router(router.router, prefix="/mpesa")
+        return app, router
+
+    def _sign(self, body: bytes, secret: str) -> str:
+        import hashlib, hmac as _hmac
+        return _hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+    def test_valid_signature_accepted(self):
+        app, _ = self._make_app("supersecret")
+        client = TestClient(app)
+        payload = stk_success_payload(receipt="HMAC_1")
+        body = json.dumps(payload).encode()
+        sig = self._sign(body, "supersecret")
+        r = client.post("/mpesa/stk/callback", content=body,
+                       headers={"Content-Type": "application/json", "X-Mpesa-Signature": sig})
+        assert r.status_code == 200
+
+    def test_invalid_signature_rejected(self):
+        app, _ = self._make_app("supersecret")
+        client = TestClient(app)
+        payload = stk_success_payload(receipt="HMAC_2")
+        r = client.post("/mpesa/stk/callback", json=payload,
+                       headers={"X-Mpesa-Signature": "wrongsig"})
+        assert r.status_code == 401
