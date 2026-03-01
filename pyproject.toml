@@ -5,22 +5,28 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mpesa-webhooks"
 version = "1.0.0"
-description = "Production FastAPI handler for M-Pesa Daraja callbacks — idempotent, DLQ, pluggable storage."
+description = "Production FastAPI handler for M-Pesa Daraja callbacks — idempotent, HMAC-verified, pluggable storage."
 readme = "README.md"
 license = {text = "CC-BY-NC-ND-4.0"}
 authors = [{name = "Gabriel Mahia", email = "contact@aikungfu.dev"}]
-keywords = ["mpesa", "safaricom", "daraja", "webhooks", "fastapi", "kenya", "fintech"]
+keywords = ["mpesa", "safaricom", "daraja", "webhooks", "fastapi", "kenya", "fintech", "callbacks"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
-    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
     "Programming Language :: Python :: 3",
-    "Typing :: Typed",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
 ]
 requires-python = ">=3.10"
-dependencies = ["fastapi>=0.110"]
+dependencies = [
+    "fastapi>=0.110",
+    "pydantic>=2.0",
+]
 
 [project.optional-dependencies]
+server = ["uvicorn[standard]>=0.27"]
 dev = ["pytest>=7", "httpx>=0.27", "ruff"]
 
 [project.urls]
@@ -32,6 +38,7 @@ addopts = "--tb=short -q"
 
 [tool.ruff]
 line-length = 100
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W"]
