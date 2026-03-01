@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mpesa-webhooks"
+version = "1.0.0"
+description = "Production FastAPI handler for M-Pesa Daraja callbacks — idempotent, DLQ, pluggable storage."
+readme = "README.md"
+license = {text = "CC-BY-NC-ND-4.0"}
+authors = [{name = "Gabriel Mahia", email = "contact@aikungfu.dev"}]
+keywords = ["mpesa", "safaricom", "daraja", "webhooks", "fastapi", "kenya", "fintech"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Topic :: Internet :: WWW/HTTP",
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+]
+requires-python = ">=3.10"
+dependencies = ["fastapi>=0.110"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "httpx>=0.27", "ruff"]
+
+[project.urls]
+Homepage = "https://github.com/gabrielmahia/mpesa-webhooks"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short -q"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]
