@@ -1,4 +1,4 @@
-name: CI
+name: CI — Lint & Test
 
 on:
   push:
@@ -18,6 +18,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: "pip"
-      - run: pip install fastapi httpx pytest ruff
+      - run: pip install fastapi pydantic httpx pytest ruff "uvicorn[standard]"
       - run: ruff check mpesa_webhooks/ tests/ --ignore E501
       - run: pytest -q --tb=short
