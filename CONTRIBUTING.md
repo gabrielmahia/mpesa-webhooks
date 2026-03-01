@@ -1,4 +1,4 @@
 # Contributing
 
-Open Issues for bugs or storage backend proposals.
-PRs welcome. All changes must include tests.
+Open Issues for: new callback payload types, storage backend implementations, or security improvements.
+PRs welcome for test coverage and documentation.
