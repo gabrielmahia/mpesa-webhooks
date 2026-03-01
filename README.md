@@ -1,15 +1,15 @@
 # mpesa-webhooks
 
-**Production FastAPI handler for M-Pesa Daraja callbacks. Idempotent. Dead-letter queue. Pluggable storage.**
+**Production FastAPI handler for M-Pesa Daraja callbacks.**
 
 [![CI](https://github.com/gabrielmahia/mpesa-webhooks/actions/workflows/ci.yml/badge.svg)](https://github.com/gabrielmahia/mpesa-webhooks/actions)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](#)
-[![Tests](https://img.shields.io/badge/tests-42%20passing-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/tests-44%20passing-brightgreen)](#)
 [![License](https://img.shields.io/badge/License-CC%20BY--NC--ND%204.0-lightgrey)](LICENSE)
 
-The hardest part of M-Pesa integration is not the STK Push — it is handling the callback correctly.
-Safaricom will retry. Your server will restart mid-payment. The same receipt will arrive twice.
-This library handles all of that so your application code does not have to.
+Handles STK Push callbacks, B2C results, and C2B confirmations with production-grade
+guarantees out of the box: idempotency, HMAC signature verification, pluggable storage,
+and a dead-letter queue so failed handlers never silently drop a payment.
 
 ---
 
@@ -17,183 +17,206 @@ This library handles all of that so your application code does not have to.
 
 ```bash
 pip install mpesa-webhooks
+# With uvicorn for standalone serving:
+pip install "mpesa-webhooks[server]"
 ```
 
 ---
 
-## Mount in your FastAPI app
+## Quickstart
 
 ```python
 from fastapi import FastAPI
-from mpesa_webhooks.router import build_router, WebhookConfig
-from mpesa_webhooks.models import StkPushCallback, B2CResultCallback
-
-async def on_payment_received(cb: StkPushCallback) -> None:
-    await db.record_payment(
-        receipt=cb.mpesa_receipt,
-        amount=cb.amount,
-        phone=cb.phone_number,
-        checkout_id=cb.checkout_request_id,
-    )
-
-async def on_payment_failed(cb: StkPushCallback) -> None:
-    await db.mark_payment_failed(
-        checkout_id=cb.checkout_request_id,
-        reason=cb.result_desc,
-    )
-
-config = WebhookConfig(
-    on_stk_success=on_payment_received,
-    on_stk_failure=on_payment_failed,
-)
+from mpesa_webhooks import MpesaWebhookRouter, STKSuccessEvent, STKFailureEvent
 
 app = FastAPI()
-app.include_router(build_router(config), prefix="/mpesa")
+router = MpesaWebhookRouter()
+
+@router.on_stk_success
+async def payment_received(event: STKSuccessEvent):
+    print(f"Payment {event.receipt}: KES {event.amount} from {event.phone}")
+    await db.orders.mark_paid(event.checkout_request_id, event.receipt)
+
+@router.on_stk_failure
+async def payment_failed(event: STKFailureEvent):
+    print(f"Payment failed: {event.result_code} — {event.result_desc}")
+    await db.orders.mark_failed(event.checkout_request_id)
+
+app.include_router(router.router, prefix="/mpesa")
 ```
 
-Register with Safaricom:
-- STK Push callback URL: `https://yourdomain.com/mpesa/stk/callback`
-- B2C result URL: `https://yourdomain.com/mpesa/b2c/result`
-- C2B confirmation URL: `https://yourdomain.com/mpesa/c2b/confirmation`
+Then register your callback URL in the Daraja portal:
+```
+https://yourapp.com/mpesa/stk/callback
+```
 
 ---
 
-## Why this library exists
+## Endpoints
 
-Three things break every M-Pesa webhook integration in production:
+| Endpoint | Handles |
+|----------|---------|
+| `POST /mpesa/stk/callback` | STK Push success and failure |
+| `POST /mpesa/b2c/result` | B2C disbursement result |
+| `POST /mpesa/b2c/timeout` | B2C queue timeout |
+| `POST /mpesa/c2b/confirmation` | C2B payment confirmed |
+| `POST /mpesa/c2b/validation` | C2B payment validation (accepts by default) |
+| `GET  /mpesa/health` | Health check |
 
-**1. Duplicate callbacks.** Safaricom retries on timeout. If your `/callback` takes >5s, you will
-receive the same payment notification multiple times. Without idempotency, you record the payment twice.
+---
 
+## Events
+
+### `STKSuccessEvent`
 ```python
-# Built-in: checkout_request_id is your idempotency key
-# The router deduplicates automatically — your handler is called exactly once
+event.receipt              # "NLJ7RT61SV" — M-Pesa receipt number
+event.amount               # 100.0
+event.phone                # "254712345678"
+event.checkout_request_id  # "ws_CO_..."
+event.transaction_date     # datetime(2024, 1, 15, 14, 30, 22)
 ```
 
-**2. Exceptions swallowed by Safaricom retries.** If your handler raises and you return HTTP 500,
-Safaricom retries. If your DB is down for 2 minutes, you get 20 duplicate attempts.
-
+### `STKFailureEvent`
 ```python
-# Built-in: handler exceptions are caught, written to DLQ, still return 200
-# Your retry logic runs on your schedule, not Safaricom's
+event.result_code   # 1032 (cancelled), 1037 (timeout), 2001 (wrong PIN)
+event.result_desc   # "Request cancelled by user"
+event.checkout_request_id
 ```
 
-**3. Parsing the callback is fragile.** The `CallbackMetadata.Item` array is a list of `{"Name": ..., "Value": ...}`
-objects, not a dict. The `TransactionDate` is an integer formatted as `YYYYMMDDHHmmss`. `PhoneNumber`
-is a long, not a string. Getting this wrong causes silent data loss.
-
+### `B2CResultEvent`
 ```python
-# Built-in: StkPushCallback.from_daraja() handles all of this
-cb = StkPushCallback.from_daraja(payload)
-cb.mpesa_receipt     # str | None
-cb.transaction_date  # datetime | None (properly parsed)
-cb.phone_number      # "254712345678" as str
+event.succeeded    # True / False
+event.receipt      # "NLJ7RT61SV"
+event.amount       # 500.0
+event.phone        # "254712345678"
+```
+
+### `C2BConfirmationEvent`
+```python
+event.trans_id         # "NLJ7RT61SV"
+event.trans_amount     # 500.0
+event.bill_ref_number  # "INV001" — your account reference
+event.msisdn           # "254712345678"
 ```
 
 ---
 
 ## Idempotency
 
+Every M-Pesa receipt number is checked against storage before calling handlers.
+Duplicate callbacks — which Safaricom sends on retries — are detected and silently
+acknowledged without re-running your business logic.
+
 ```python
-from mpesa_webhooks.idempotency import IdempotencyChecker, InMemoryIdempotencyStore
+# First delivery: handlers called, receipt saved
+POST /mpesa/stk/callback  →  handlers run, receipt "NLJ7RT61SV" saved
 
-# Default: in-memory (single process)
-checker = IdempotencyChecker()
-
-# Production (multi-replica): plug in Redis
-import redis
-class RedisStore:
-    def __init__(self): self.r = redis.Redis()
-    def exists(self, key): return bool(self.r.exists(key))
-    def mark(self, key, ttl_seconds=86400): self.r.setex(key, ttl_seconds, 1)
-
-checker = IdempotencyChecker(store=RedisStore())
-config = WebhookConfig(on_stk_success=handler, idempotency=checker)
+# Safaricom retries the same callback 30 seconds later:
+POST /mpesa/stk/callback  →  duplicate detected, handlers skipped, 200 returned
 ```
 
 ---
 
 ## Dead-letter queue
 
+If a handler raises an exception, the callback is pushed to a dead-letter queue
+and the **next handler still runs**. Safaricom always receives HTTP 200. Nothing
+is silently dropped.
+
 ```python
-from mpesa_webhooks.dlq import InMemoryDLQ
+@router.on_stk_success
+async def save_to_db(event: STKSuccessEvent):
+    await db.save(event)  # If this raises, goes to dead-letter
 
-dlq = InMemoryDLQ(max_attempts=5)
-config = WebhookConfig(on_stk_success=handler, dlq=dlq)
-
-# Background worker — retry every 30s
-import asyncio
-async def retry_worker():
-    while True:
-        for letter in dlq.pending():
-            try:
-                cb = StkPushCallback.from_daraja(letter.raw_payload)
-                await handler(cb)
-                dlq.remove(letter)
-            except Exception as exc:
-                letter.record_retry_failure(str(exc), dlq.backoff_seconds(letter.attempts))
-        await asyncio.sleep(30)
+@router.on_stk_success
+async def send_sms(event: STKSuccessEvent):
+    await sms.send(event.phone, f"Payment received: KES {event.amount}")
+    # This still runs even if save_to_db failed
 ```
 
 ---
 
-## Parsed models
+## HMAC signature verification
 
-### StkPushCallback
-| Field | Type | Notes |
-|-------|------|-------|
-| `checkout_request_id` | `str` | Idempotency key |
-| `result_code` | `int` | 0 = success |
-| `amount` | `float \| None` | Success only |
-| `mpesa_receipt` | `str \| None` | Success only |
-| `phone_number` | `str \| None` | E.164 format |
-| `transaction_date` | `datetime \| None` | Parsed from Safaricom integer |
-| `.succeeded` | `bool` | `result_code == 0` |
-| `.user_cancelled` | `bool` | `result_code == 1032` |
-| `.insufficient_funds` | `bool` | `result_code == 1` |
-
-### B2CResultCallback
-| Field | Type |
-|-------|------|
-| `conversation_id` | `str` |
-| `transaction_id` | `str` |
-| `transaction_amount` | `float \| None` |
-| `receiver_phone` | `str \| None` |
-
----
-
-## Health check
-
-```
-GET /mpesa/health
-→ {"status": "ok", "dlq_pending": 0, "dlq_exhausted": 0, "ts": 1234567890.0}
+```python
+router = MpesaWebhookRouter(hmac_secret="your-shared-secret")
+# Requests without a valid X-Mpesa-Signature header return HTTP 401
 ```
 
 ---
 
-## Used with daraja-mock in tests
+## IP allowlist
+
+```python
+router = MpesaWebhookRouter(
+    safaricom_ips=[
+        "196.201.214.200", "196.201.214.201", "196.201.214.202", "196.201.214.203",
+        "196.201.214.206", "196.201.214.207", "196.201.213.114",
+    ]
+)
+```
+
+---
+
+## Custom storage backend
+
+The default `InMemoryStorage` is for development only — data is lost on restart.
+For production, implement `StorageBackend`:
+
+```python
+from mpesa_webhooks import StorageBackend, MpesaWebhookRouter
+
+class PostgresStorage(StorageBackend):
+    async def receipt_exists(self, receipt: str) -> bool:
+        return await db.fetchval("SELECT 1 FROM receipts WHERE receipt = $1", receipt)
+
+    async def save_receipt(self, receipt: str, payload: dict) -> None:
+        await db.execute("INSERT INTO receipts (receipt, payload) VALUES ($1, $2)",
+                        receipt, json.dumps(payload))
+
+    async def push_dead_letter(self, endpoint: str, payload: dict, error: str) -> None:
+        await db.execute("INSERT INTO dead_letters (endpoint, payload, error) VALUES ($1, $2, $3)",
+                        endpoint, json.dumps(payload), error)
+
+    async def pop_dead_letters(self) -> list[dict]:
+        rows = await db.fetch("DELETE FROM dead_letters RETURNING *")
+        return [dict(r) for r in rows]
+
+router = MpesaWebhookRouter(storage=PostgresStorage())
+```
+
+---
+
+## Testing with daraja-mock
 
 ```python
 from daraja_mock import DarajaMock, Scenario
+from fastapi.testclient import TestClient
 
-def test_duplicate_payment_handled_once():
+def test_payment_flow():
     mock = DarajaMock()
     received = []
-    def handler(cb): received.append(cb)
 
-    config = WebhookConfig(on_stk_success=handler)
+    router = MpesaWebhookRouter()
+
+    @router.on_stk_success
+    async def handler(event):
+        received.append(event)
+
     app = FastAPI()
-    app.include_router(build_router(config), prefix="/mpesa")
+    app.include_router(router.router, prefix="/mpesa")
+    client = TestClient(app)
 
-    with TestClient(app) as client:
-        payload = mock.build_stk_callback(checkout_request_id="ws_CO_001")
-        client.post("/mpesa/stk/callback", json=payload)
-        client.post("/mpesa/stk/callback", json=payload)  # Safaricom retry
+    # Simulate Safaricom posting the callback
+    callback = mock.build_stk_callback(scenario=Scenario.SUCCESS)
+    r = client.post("/mpesa/stk/callback", json=callback)
 
-    assert len(received) == 1  # handled exactly once
+    assert r.status_code == 200
+    assert len(received) == 1
+    assert received[0].amount == 100
 ```
 
 ---
 
+*Part of the [nairobi-stack](https://github.com/gabrielmahia/nairobi-stack) East Africa engineering ecosystem.*
 *Maintained by [Gabriel Mahia](https://github.com/gabrielmahia). Kenya × USA.*
-*Part of the [East Africa fintech toolkit](https://github.com/gabrielmahia/nairobi-stack).*
